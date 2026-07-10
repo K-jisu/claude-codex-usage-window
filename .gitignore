@@ -1,0 +1,8 @@
+*.log
+*.bak
+Thumbs.db
+desktop.ini
+
+# 로컬 전용 (커밋 제외)
+.claude/
+.codex-refresh-ts
