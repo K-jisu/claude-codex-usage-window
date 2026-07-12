@@ -517,17 +517,23 @@ function Build-Menu($state, $scope = 'all') {
 }
 
 function Refresh-All {
+  # 성공 시 $true, 수집/갱신 실패 시 $false 반환 (호출측이 피드백을 결정)
   try {
     $state = Get-State
     $script:lastState = $state     # 메뉴는 Opening에서 이 상태로 재구성됨
     Sync-Icons $state
-  } catch {}
+    return $true
+  } catch {
+    return $false
+  }
 }
-# 수동 새로고침: 재조회 후 완료 알림(풍선)으로 확실한 피드백
+# 수동 새로고침: 재조회 성공 시에만 완료 알림(풍선)으로 피드백
 function Manual-Refresh {
-  Refresh-All
+  if (-not (Refresh-All)) { return }   # 실패를 '완료'로 표시하지 않음
   try {
-    $ni = if ($script:lastIcon) { $script:lastIcon } elseif ($script:icons.Count) { $script:icons[0] } else { $null }
+    # Sync-Icons가 아이콘을 재생성/제거했을 수 있으니 현재 목록에서 같은 스코프로 다시 찾음
+    $ni = $script:icons | Where-Object { $_.Tag -eq $script:lastScope } | Select-Object -First 1
+    if (-not $ni -and $script:icons.Count) { $ni = $script:icons[0] }
     if ($ni -and $ni.Visible) {
       $ni.ShowBalloonTip(1200, 'Claude & Codex Usage', ("새로고침 완료 · {0}" -f (Get-Date).ToString('HH:mm:ss')), [System.Windows.Forms.ToolTipIcon]::Info)
     }
@@ -554,9 +560,9 @@ if (-not $acquired) { exit }
 
 $script:timer = New-Object System.Windows.Forms.Timer
 $script:timer.Interval = $script:REFRESH_MS
-$script:timer.Add_Tick({ Refresh-All })
+$script:timer.Add_Tick({ Refresh-All | Out-Null })
 
-Refresh-All
+Refresh-All | Out-Null
 $script:timer.Start()
 
 $script:ctx = New-Object System.Windows.Forms.ApplicationContext
