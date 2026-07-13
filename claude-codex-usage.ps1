@@ -143,17 +143,35 @@ function New-BatteryBitmap([double]$remain, [bool]$dark, [int]$N) {
   }
   return $bmp
 }
-# 여러 크기를 담은 .ico(각 프레임 PNG)로 패키징 → 어떤 DPI에서도 선명
-function New-TrayIcon([double]$remain, [bool]$dark) {
-  $sizes = @(16, 20, 24, 32, 40, 48)
-  $frames = @()
-  foreach ($s in $sizes) {
-    $bmp = New-BatteryBitmap $remain $dark $s
+# 전체(요약) 아이콘: 색 타일 + 목록 3줄 (전체 잔량 최솟값으로 색). 배터리 캡슐과 구분됨.
+function New-AllBitmap([double]$worst, [bool]$dark, [int]$N) {
+  $bmp = New-Object Drawing.Bitmap($N, $N, [Drawing.Imaging.PixelFormat]::Format32bppArgb)
+  $heat = Heat-Color $worst
+  $line = [Drawing.Color]::FromArgb(25, 25, 25)     # 밝은 타일 위 목록선(어두움)
+  $SetP = { param($x, $y, $c) if ($x -ge 0 -and $y -ge 0 -and $x -lt $N -and $y -lt $N) { $bmp.SetPixel($x, $y, $c) } }
+  $m = [int]($N * 0.13)
+  $x0 = $m; $y0 = $m; $x1 = $N - 1 - $m; $y1 = $N - 1 - $m
+  for ($y = $y0; $y -le $y1; $y++) { for ($x = $x0; $x -le $x1; $x++) {
+    $corner = (($x -eq $x0) -or ($x -eq $x1)) -and (($y -eq $y0) -or ($y -eq $y1))  # 모서리 1px 깎아 라운드 느낌
+    if (-not $corner) { & $SetP $x $y $heat }
+  }}
+  $lw = [int](($x1 - $x0) * 0.58); $lx = $x0 + [int]((($x1 - $x0) - $lw) / 2)
+  $lh = [math]::Max(1, [int]($N / 13))
+  foreach ($fr in @(0.28, 0.50, 0.72)) {
+    $ly = $y0 + [int]((($y1 - $y0)) * $fr)
+    for ($t = 0; $t -lt $lh; $t++) { for ($x = 0; $x -lt $lw; $x++) { & $SetP ($lx + $x) ($ly + $t) $line } }
+  }
+  return $bmp
+}
+# 여러 크기 비트맵 → 멀티사이즈 .ico (각 프레임 PNG). 어떤 DPI에서도 선명.
+$script:ICON_SIZES = @(16, 20, 24, 32, 40, 48)
+function Pack-Icon($bitmaps) {
+  $frames = @(); $sizes = @()
+  foreach ($b in $bitmaps) {
     $ms = New-Object IO.MemoryStream
-    $bmp.Save($ms, [Drawing.Imaging.ImageFormat]::Png)
-    $bmp.Dispose()
-    $frames += , ($ms.ToArray())
-    $ms.Dispose()
+    $b.Save($ms, [Drawing.Imaging.ImageFormat]::Png)
+    $frames += , ($ms.ToArray()); $sizes += $b.Width
+    $ms.Dispose(); $b.Dispose()
   }
   $out = New-Object IO.MemoryStream
   $bw = New-Object IO.BinaryWriter($out)
@@ -173,6 +191,12 @@ function New-TrayIcon([double]$remain, [bool]$dark) {
   $icon = New-Object Drawing.Icon($out)
   $bw.Dispose(); $out.Dispose()
   return $icon
+}
+function New-TrayIcon([double]$remain, [bool]$dark) {
+  Pack-Icon @(foreach ($s in $script:ICON_SIZES) { New-BatteryBitmap $remain $dark $s })
+}
+function New-AllIcon([double]$worst, [bool]$dark) {
+  Pack-Icon @(foreach ($s in $script:ICON_SIZES) { New-AllBitmap $worst $dark $s })
 }
 
 # ── 유니코드 게이지(부분 블록) ─────────────────────────────────────────
@@ -343,46 +367,60 @@ $script:menu  = New-Object System.Windows.Forms.ContextMenuStrip
 $script:menu.ShowImageMargin = $false
 $script:menu.ShowCheckMargin = $false
 $script:menu.Font = New-Object Drawing.Font('Consolas', 9)
+$script:lastState = $null                    # 마지막 수집 상태 (메뉴 열 때 재구성용)
+$script:lastScope = 'all'                    # 마지막 클릭 아이콘의 스코프
+$script:lastIcon  = $null                    # 마지막 클릭된 NotifyIcon (새로고침 후 재오픈용)
 
-function Show-TrayMenu {
-  $script:menu.Show([System.Windows.Forms.Cursor]::Position)
+# NotifyIcon의 private ShowContextMenu 를 좌클릭에서도 호출(네이티브 포커스/자동닫힘)
+$script:ShowCtxMethod = [System.Windows.Forms.NotifyIcon].GetMethod(
+  'ShowContextMenu', [System.Reflection.BindingFlags]([System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::NonPublic))
+function Show-ScopedMenu($ni) {
+  if (-not $ni) { return }
+  $script:lastScope = [string]$ni.Tag
+  $script:lastIcon = $ni
+  try { $script:ShowCtxMethod.Invoke($ni, $null) | Out-Null } catch { $script:menu.Show([System.Windows.Forms.Cursor]::Position) }
 }
+# 메뉴가 열릴 때마다 마지막 클릭 스코프로 최신 상태 재구성 → 항상 신선 + 스코프별 표시
+$script:menu.Add_Opening({ param($s, $e) if ($script:lastState) { Build-Menu $script:lastState $script:lastScope } })
 
+function New-TrayNotifyIcon {
+  $ni = New-Object System.Windows.Forms.NotifyIcon
+  $ni.ContextMenuStrip = $script:menu   # 우클릭: 네이티브로 열림 → Opening에서 스코프별 재구성
+  $ni.Add_MouseDown({ param($s, $e) $script:lastScope = [string]$s.Tag; $script:lastIcon = $s })
+  $ni.Add_MouseUp({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Show-ScopedMenu $s } })
+  return $ni
+}
 function Sync-Icons($state) {
   $dark = Is-TrayDark
-  $n = $state.items.Count
-  # 필요한 개수만큼 NotifyIcon 확보
-  while ($script:icons.Count -lt $n) {
-    $ni = New-Object System.Windows.Forms.NotifyIcon
-    $ni.ContextMenuStrip = $script:menu
-    $ni.Add_MouseClick({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Show-TrayMenu } })
-    $script:icons.Add($ni)
+  # 아이콘 스펙: [전체 요약] 먼저, 그 뒤 각 배터리(스코프 태그: claude/codex)
+  $specs = New-Object System.Collections.Generic.List[object]
+  if ($state.items.Count -gt 0) {
+    $worst = ($state.items | ForEach-Object { $_.remain } | Measure-Object -Minimum).Minimum
+    $summary = (($state.items | ForEach-Object { "$($_.label) $([int]$_.remain)%" }) -join ' · ')
+    $specs.Add([pscustomobject]@{ all = $true; remain = [double]$worst; scope = 'all'; tip = "전체 · $summary" })
   }
-  # 남는 아이콘 제거
+  foreach ($it in $state.items) {
+    $scope = if ("$($it.label)"[0] -eq 'C') { 'claude' } else { 'codex' }
+    $specs.Add([pscustomobject]@{ all = $false; remain = [double]$it.remain; scope = $scope; tip = $it.tip })
+  }
+  if ($specs.Count -eq 0) {
+    $specs.Add([pscustomobject]@{ all = $true; remain = 0.0; scope = 'all'; tip = 'Claude/Codex 사용량 대기 중' })
+  }
+
+  $n = $specs.Count
+  while ($script:icons.Count -lt $n) { $script:icons.Add((New-TrayNotifyIcon)) }
   while ($script:icons.Count -gt $n) {
     $ni = $script:icons[$script:icons.Count - 1]
     $ni.Visible = $false; if ($ni.Icon) { $ni.Icon.Dispose() }; $ni.Dispose()
     $script:icons.RemoveAt($script:icons.Count - 1)
   }
-  # 아이콘/툴팁 갱신
   for ($i = 0; $i -lt $n; $i++) {
-    $it = $state.items[$i]; $ni = $script:icons[$i]
-    $old = $ni.Icon
-    $ni.Icon = New-TrayIcon ([double]$it.remain) $dark
-    $tip = $it.tip; if ($tip.Length -gt 62) { $tip = $tip.Substring(0, 62) }
+    $sp = $specs[$i]; $ni = $script:icons[$i]; $old = $ni.Icon
+    $ni.Icon = if ($sp.all) { New-AllIcon $sp.remain $dark } else { New-TrayIcon $sp.remain $dark }
+    $ni.Tag = $sp.scope
+    $tip = $sp.tip; if ($tip.Length -gt 62) { $tip = $tip.Substring(0, 62) }
     $ni.Text = $tip
     $ni.Visible = $true
-    if ($old) { $old.Dispose() }
-  }
-  if ($n -eq 0) {
-    # 데이터 없음: 안내 아이콘 1개
-    if ($script:icons.Count -eq 0) {
-      $ni = New-Object System.Windows.Forms.NotifyIcon; $ni.ContextMenuStrip = $script:menu
-      $ni.Add_MouseClick({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Show-TrayMenu } })
-      $script:icons.Add($ni)
-    }
-    $ni = $script:icons[0]; $old = $ni.Icon
-    $ni.Icon = New-TrayIcon 0 $dark; $ni.Text = 'Claude/Codex 사용량 대기 중'; $ni.Visible = $true
     if ($old) { $old.Dispose() }
   }
 }
@@ -395,12 +433,14 @@ function Add-Label($text, $color) {
 }
 function Add-Sep { $script:menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null }
 
-function Build-Menu($state) {
+function Build-Menu($state, $scope = 'all') {
   $now = $state.measuredNow
   $gray = [Drawing.Color]::FromArgb(139, 148, 158)
+  $showClaude = ($scope -ne 'codex') -and $state.hasClaude   # 'all'/'claude'
+  $showCodex  = ($scope -ne 'claude') -and $state.hasCodex   # 'all'/'codex'
   $script:menu.Items.Clear()
 
-  if ($state.hasClaude) {
+  if ($showClaude) {
     Add-Label 'Claude Code' $gray
     if ($state.usage) {
       $rows = @(
@@ -433,7 +473,7 @@ function Build-Menu($state) {
     Add-Sep
   }
 
-  if ($state.hasCodex) {
+  if ($showCodex) {
     $cx = $state.codex
     $planTxt = if ($cx.plan) { ' · ' + $cx.plan } elseif ($cx.limitId) { ' · ' + $cx.limitId } else { '' }
     Add-Label ("Codex{0}" -f $planTxt) $gray
@@ -460,13 +500,13 @@ function Build-Menu($state) {
     Add-Sep
   }
 
-  if (-not $state.hasClaude -and -not $state.hasCodex) {
+  if (-not $showClaude -and -not $showCodex) {
     Add-Label 'Claude Code나 Codex를 실행하면 사용량이 표시됩니다' $gray
     Add-Sep
   }
 
   $refresh = New-Object System.Windows.Forms.ToolStripMenuItem('🔄 지금 새로고침')
-  $refresh.Add_Click({ Refresh-All }) | Out-Null
+  $refresh.Add_Click({ Manual-Refresh }) | Out-Null
   $script:menu.Items.Add($refresh) | Out-Null
 
   $quit = New-Object System.Windows.Forms.ToolStripMenuItem('❌ 종료')
@@ -477,10 +517,26 @@ function Build-Menu($state) {
 }
 
 function Refresh-All {
+  # 성공 시 $true, 수집/갱신 실패 시 $false 반환 (호출측이 피드백을 결정)
   try {
     $state = Get-State
+    $script:lastState = $state     # 메뉴는 Opening에서 이 상태로 재구성됨
     Sync-Icons $state
-    Build-Menu $state
+    return $true
+  } catch {
+    return $false
+  }
+}
+# 수동 새로고침: 재조회 성공 시에만 완료 알림(풍선)으로 피드백
+function Manual-Refresh {
+  if (-not (Refresh-All)) { return }   # 실패를 '완료'로 표시하지 않음
+  try {
+    # Sync-Icons가 아이콘을 재생성/제거했을 수 있으니 현재 목록에서 같은 스코프로 다시 찾음
+    $ni = $script:icons | Where-Object { $_.Tag -eq $script:lastScope } | Select-Object -First 1
+    if (-not $ni -and $script:icons.Count) { $ni = $script:icons[0] }
+    if ($ni -and $ni.Visible) {
+      $ni.ShowBalloonTip(1200, 'Claude & Codex Usage', ("새로고침 완료 · {0}" -f (Get-Date).ToString('HH:mm:ss')), [System.Windows.Forms.ToolTipIcon]::Info)
+    }
   } catch {}
 }
 
@@ -504,9 +560,9 @@ if (-not $acquired) { exit }
 
 $script:timer = New-Object System.Windows.Forms.Timer
 $script:timer.Interval = $script:REFRESH_MS
-$script:timer.Add_Tick({ Refresh-All })
+$script:timer.Add_Tick({ Refresh-All | Out-Null })
 
-Refresh-All
+Refresh-All | Out-Null
 $script:timer.Start()
 
 $script:ctx = New-Object System.Windows.Forms.ApplicationContext
